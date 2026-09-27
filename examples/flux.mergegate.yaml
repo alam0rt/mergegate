@@ -1,0 +1,13 @@
+# .mergegate.yaml for a Flux GitOps repo. Commit it to the default branch:
+# the gate always reads it from the PR's base branch, not the PR itself.
+
+# Flux upgrading itself rewrites gotk-components.yaml. The diffs are usually
+# pure version bumps, but a bad one takes down reconciliation for the whole
+# cluster, so a human looks.
+protected_paths:
+  - "clusters/*/flux-system/**"
+
+# Only the image-automation bot may auto-merge.
+allowed_authors:
+  - "app/github-actions"
+  - "github-actions[bot]"
