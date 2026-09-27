@@ -11,3 +11,13 @@ protected_paths:
 allowed_authors:
   - "app/github-actions"
   - "github-actions[bot]"
+
+# Repo-specific questions for Jev. "Yes" means a human should look. A watch
+# can only send a PR to review, never approve one. Examples:
+# watch:
+#   - id: headscale
+#     question: "Does this diff change the headscale container image or its version?"
+#     paths: ["clusters/**"]
+#     threshold: 0.5
+#   - id: ingress_snippets
+#     question: "Does this diff add or enable nginx configuration-snippet or server-snippet annotations?"

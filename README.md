@@ -29,8 +29,8 @@ The steps run in order. The first one that decides wins.
 | 4 | Every file matches `docs_paths` | **auto-merge**, no model call |
 | 5 | A non-docs file has no patch (binary, or too big for GitHub to render) | review |
 | 6 | More than `max_changed_lines` added + removed | review |
-| 7 | Ask Jev (below) | auto-merge or review |
-| 8 | Any `watch` question (see [Watches](#watches-your-own-questions)) answers yes | review |
+| 7 | Ask Jev (below) | review, or continue to 8 |
+| 8 | Any `watch` question (see [Watches](#watches-your-own-questions)) answers yes | review, otherwise **auto-merge** |
 
 Jev gets the title and the per-file diffs. It never sees the PR description,
 which is free text that states intent rather than showing the change. All six
