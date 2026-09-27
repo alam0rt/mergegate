@@ -188,7 +188,10 @@ For a workflow that opens PRs with `GITHUB_TOKEN`, add steps after the PR is
 created or updated. Model them on `mergegate-wait.yaml`: gate, then wait for
 checks on the judged SHA, then `gh pr merge --match-head-commit`. The job
 must expose the PR number, and needs `contents: write`, `pull-requests:
-write`, `checks: read` and `statuses: read`. Merges made with `GITHUB_TOKEN`
+write`, `checks: read` and `statuses: read`. **Only count `push`-event check runs**: a PR opened by
+`github-actions[bot]` also spawns `pull_request` runs of the same workflows,
+and they sit at `action_required` waiting for approval. Waiting on those
+blocks every merge. Merges made with `GITHUB_TOKEN`
 don't trigger workflows either. So if the repo relies on a workflow that
 deletes merged branches or runs on push to the default branch, delete the
 branch in the same job: `gh api -X DELETE repos/$GITHUB_REPOSITORY/git/refs/heads/$BRANCH`.
