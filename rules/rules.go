@@ -6,7 +6,9 @@ package rules
 import (
 	"fmt"
 	"io"
+	"regexp"
 	"slices"
+	"strings"
 
 	"github.com/alam0rt/mergegate"
 	"github.com/bmatcuk/doublestar/v4"
@@ -29,6 +31,42 @@ type Config struct {
 	AllowedAuthors []string `yaml:"allowed_authors"`
 	// Thresholds tune how sure the model has to be.
 	Thresholds Thresholds `yaml:"thresholds"`
+	// Watches are extra repo-specific questions for the model. They can only
+	// send a PR to review, never approve one.
+	Watches []Watch `yaml:"watch"`
+}
+
+// Watch is a yes/no question phrased so that "yes" means "a human should
+// look". If the model's p(yes) exceeds the limit, the PR needs review.
+type Watch struct {
+	ID       string `yaml:"id"`
+	Question string `yaml:"question"`
+	// Paths, when set, limit the watch to PRs where a changed file (or a
+	// rename source) matches one of these globs.
+	Paths []string `yaml:"paths"`
+	// Threshold overrides Thresholds.No for this watch.
+	Threshold *float64 `yaml:"threshold"`
+}
+
+// Limit is the highest p(yes) at which the watch still passes.
+func (w Watch) Limit(t Thresholds) float64 {
+	if w.Threshold != nil {
+		return *w.Threshold
+	}
+	return t.No
+}
+
+// Applies reports whether the watch should be asked about pr.
+func (w Watch) Applies(pr mergegate.PullRequest) bool {
+	if len(w.Paths) == 0 {
+		return true
+	}
+	for _, f := range pr.Files {
+		if matchAny(w.Paths, f.Path) || (f.PreviousPath != "" && matchAny(w.Paths, f.PreviousPath)) {
+			return true
+		}
+	}
+	return false
 }
 
 // Thresholds are the probability cut-offs the gate applies to model answers.
@@ -68,6 +106,7 @@ type fileConfig struct {
 	MaxChangedLines *int        `yaml:"max_changed_lines"`
 	AllowedAuthors  []string    `yaml:"allowed_authors"`
 	Thresholds      *Thresholds `yaml:"thresholds"`
+	Watches         []Watch     `yaml:"watch"`
 }
 
 // Load reads a YAML config and layers it over Default.
@@ -89,6 +128,10 @@ func Load(r io.Reader) (Config, error) {
 	cfg.AllowedAuthors = fc.AllowedAuthors
 	if fc.Thresholds != nil {
 		cfg.Thresholds = *fc.Thresholds
+	}
+	cfg.Watches = fc.Watches
+	if err := validateWatches(cfg.Watches); err != nil {
+		return Config{}, err
 	}
 	for _, g := range slices.Concat(cfg.DocsPaths, cfg.ProtectedPaths) {
 		if !doublestar.ValidatePattern(g) {
@@ -145,4 +188,29 @@ func matchAny(globs []string, path string) bool {
 		}
 	}
 	return false
+}
+
+var watchID = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
+func validateWatches(ws []Watch) error {
+	seen := map[string]bool{}
+	for i, w := range ws {
+		switch {
+		case !watchID.MatchString(w.ID):
+			return fmt.Errorf("watch %d: id %q must match %s", i, w.ID, watchID)
+		case seen[w.ID]:
+			return fmt.Errorf("watch %q: duplicate id", w.ID)
+		case strings.TrimSpace(w.Question) == "":
+			return fmt.Errorf("watch %q: question is empty", w.ID)
+		case w.Threshold != nil && (*w.Threshold < 0 || *w.Threshold > 1):
+			return fmt.Errorf("watch %q: threshold %v is not between 0 and 1", w.ID, *w.Threshold)
+		}
+		for _, g := range w.Paths {
+			if !doublestar.ValidatePattern(g) {
+				return fmt.Errorf("watch %q: invalid glob %q", w.ID, g)
+			}
+		}
+		seen[w.ID] = true
+	}
+	return nil
 }

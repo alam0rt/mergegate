@@ -69,7 +69,7 @@ func TestAssessSendsQuestionsAndState(t *testing.T) {
 	srv := fakeServer(t, 200, okResponse, &req)
 	j := New("test-key", WithServerURL(srv.URL))
 
-	if _, err := j.Assess(context.Background(), bumpPR); err != nil {
+	if _, err := j.Assess(context.Background(), bumpPR, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -108,7 +108,7 @@ func TestAssessSendsQuestionsAndState(t *testing.T) {
 
 func TestAssessParsesAnswers(t *testing.T) {
 	srv := fakeServer(t, 200, okResponse, nil)
-	a, err := New("test-key", WithServerURL(srv.URL)).Assess(context.Background(), bumpPR)
+	a, err := New("test-key", WithServerURL(srv.URL)).Assess(context.Background(), bumpPR, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestAssessParsesAnswers(t *testing.T) {
 
 func TestAssessMissingAnswerIsError(t *testing.T) {
 	srv := fakeServer(t, 200, `{"model":"m","answers":{"docs_only":{"type":"noul","noul":0.1}},"usage":{"input_tokens":1,"output_tokens":1}}`, nil)
-	_, err := New("test-key", WithServerURL(srv.URL)).Assess(context.Background(), bumpPR)
+	_, err := New("test-key", WithServerURL(srv.URL)).Assess(context.Background(), bumpPR, nil)
 	if err == nil || !strings.Contains(err.Error(), "version_bump") {
 		t.Errorf("err = %v, want one naming the missing answer", err)
 	}
@@ -135,7 +135,7 @@ func TestAssessWrongAnswerTypeIsError(t *testing.T) {
 	body := strings.Replace(okResponse, `"removal":       {"type": "noul", "noul": 0.01}`,
 		`"removal": {"type": "choice", "choice": "x", "confidence": 1}`, 1)
 	srv := fakeServer(t, 200, body, nil)
-	if _, err := New("test-key", WithServerURL(srv.URL)).Assess(context.Background(), bumpPR); err == nil {
+	if _, err := New("test-key", WithServerURL(srv.URL)).Assess(context.Background(), bumpPR, nil); err == nil {
 		t.Error("a choice answer to a noul question should be an error")
 	}
 }
@@ -143,7 +143,35 @@ func TestAssessWrongAnswerTypeIsError(t *testing.T) {
 func TestAssessAPIErrorPropagates(t *testing.T) {
 	srv := fakeServer(t, 401, `{"error":{"message":"bad key","code":401}}`, nil)
 	j := New("test-key", WithServerURL(srv.URL), WithRetries(false))
-	if _, err := j.Assess(context.Background(), bumpPR); err == nil {
+	if _, err := j.Assess(context.Background(), bumpPR, nil); err == nil {
 		t.Error("a 401 should be an error")
+	}
+}
+
+func TestAssessAsksWatches(t *testing.T) {
+	var req map[string]any
+	body := strings.Replace(okResponse, `"answers": {`,
+		`"answers": {"watch_snippets": {"type": "noul", "noul": 0.42},`, 1)
+	srv := fakeServer(t, 200, body, &req)
+	a, err := New("test-key", WithServerURL(srv.URL)).Assess(context.Background(), bumpPR,
+		map[string]string{"snippets": "Does this add nginx snippet annotations?"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, _ := req["questions"].(map[string]any)["watch_snippets"].(map[string]any)
+	if q["type"] != "noul" || q["instructions"] != "Does this add nginx snippet annotations?" {
+		t.Errorf("watch question sent as %v", q)
+	}
+	if a.Watches["snippets"] != 0.42 {
+		t.Errorf("Watches = %v, want snippets=0.42", a.Watches)
+	}
+}
+
+func TestAssessMissingWatchAnswerIsError(t *testing.T) {
+	srv := fakeServer(t, 200, okResponse, nil)
+	_, err := New("test-key", WithServerURL(srv.URL)).Assess(context.Background(), bumpPR,
+		map[string]string{"snippets": "q"})
+	if err == nil || !strings.Contains(err.Error(), "watch_snippets") {
+		t.Errorf("err = %v, want one naming the missing watch", err)
 	}
 }

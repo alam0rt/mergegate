@@ -14,7 +14,7 @@ import (
 
 // Assessor is anything that can answer the judge's questions about a PR.
 type Assessor interface {
-	Assess(ctx context.Context, pr mergegate.PullRequest) (judge.Assessment, error)
+	Assess(ctx context.Context, pr mergegate.PullRequest, extra map[string]string) (judge.Assessment, error)
 }
 
 // Verdict is the gate's decision. AutoMerge is false unless every check
@@ -55,12 +55,44 @@ func Evaluate(ctx context.Context, cfg rules.Config, pr mergegate.PullRequest, a
 		return human("%d changed lines exceeds max_changed_lines %d", pr.ChangedLines(), cfg.MaxChangedLines)
 	}
 
-	a, err := assessor.Assess(ctx, pr)
+	var watches []rules.Watch
+	var extra map[string]string
+	for _, w := range cfg.Watches {
+		if w.Applies(pr) {
+			watches = append(watches, w)
+			if extra == nil {
+				extra = map[string]string{}
+			}
+			extra[w.ID] = w.Question
+		}
+	}
+
+	a, err := assessor.Assess(ctx, pr, extra)
 	if err != nil {
 		return v, err
 	}
 	v.Assessment = &a
 	v.AutoMerge, v.Reasons = decide(cfg.Thresholds, a)
+
+	// Watches run after decide and can only veto: a quiet watch never
+	// rescues a PR that failed a built-in check.
+	var quiet []string
+	for _, w := range watches {
+		p, ok := a.Watches[w.ID]
+		switch {
+		case !ok:
+			v.AutoMerge = false
+			v.Reasons = append(v.Reasons, fmt.Sprintf("watch %s: no answer", w.ID))
+		case p > w.Limit(cfg.Thresholds):
+			v.AutoMerge = false
+			v.Reasons = append(v.Reasons, fmt.Sprintf("watch %s: p=%.2f > %.2f (%s)", w.ID, p, w.Limit(cfg.Thresholds), w.Question))
+		default:
+			quiet = append(quiet, fmt.Sprintf("%s=%.2f", w.ID, p))
+		}
+	}
+	if v.AutoMerge && len(quiet) > 0 {
+		v.Reasons = append(v.Reasons, "watches quiet: "+strings.Join(quiet, ", "))
+	}
 	return v, nil
 }
 

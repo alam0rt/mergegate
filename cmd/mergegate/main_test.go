@@ -37,7 +37,7 @@ func (f *fakeSource) ConfigFile(_ context.Context, repo, ref string) ([]byte, er
 
 type fakeAssessor struct{ a judge.Assessment }
 
-func (f fakeAssessor) Assess(context.Context, mergegate.PullRequest) (judge.Assessment, error) {
+func (f fakeAssessor) Assess(context.Context, mergegate.PullRequest, map[string]string) (judge.Assessment, error) {
 	return f.a, nil
 }
 

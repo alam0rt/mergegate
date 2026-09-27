@@ -146,3 +146,62 @@ func TestLoadRejectsBadGlob(t *testing.T) {
 		t.Error("an invalid glob should be an error")
 	}
 }
+
+func TestLoadWatches(t *testing.T) {
+	cfg, err := Load(strings.NewReader(`
+watch:
+  - id: ingress_snippets
+    question: "Does this diff add nginx snippet annotations?"
+    paths: ["clusters/**"]
+    threshold: 0.3
+  - id: db_migration
+    question: "Does this change require a database migration?"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Watches) != 2 {
+		t.Fatalf("got %d watches, want 2", len(cfg.Watches))
+	}
+	if w := cfg.Watches[0]; w.ID != "ingress_snippets" || w.Limit(cfg.Thresholds) != 0.3 || len(w.Paths) != 1 {
+		t.Errorf("first watch = %+v", w)
+	}
+	if got := cfg.Watches[1].Limit(cfg.Thresholds); got != cfg.Thresholds.No {
+		t.Errorf("default limit = %v, want thresholds.no %v", got, cfg.Thresholds.No)
+	}
+}
+
+func TestLoadRejectsBadWatches(t *testing.T) {
+	cases := map[string]string{
+		"missing id":     "watch: [{question: q}]",
+		"bad id":         "watch: [{id: Bad-ID, question: q}]",
+		"duplicate id":   "watch: [{id: a, question: q}, {id: a, question: r}]",
+		"empty question": "watch: [{id: a}]",
+		"threshold > 1":  "watch: [{id: a, question: q, threshold: 1.5}]",
+		"bad glob":       `watch: [{id: a, question: q, paths: ["["]}]`,
+		"misspelt field": "watch: [{id: a, question: q, path: [x]}]",
+	}
+	for name, doc := range cases {
+		if _, err := Load(strings.NewReader(doc)); err == nil {
+			t.Errorf("%s: want an error", name)
+		}
+	}
+}
+
+func TestWatchApplies(t *testing.T) {
+	always := Watch{ID: "a", Question: "q"}
+	scoped := Watch{ID: "b", Question: "q", Paths: []string{"clusters/**"}}
+	inClusters := mergegate.PullRequest{Files: files("clusters/omar/x.yaml")}
+	elsewhere := mergegate.PullRequest{Files: files("apps/x.yaml")}
+	renamedOut := mergegate.PullRequest{Files: []mergegate.File{{Path: "apps/x.yaml", PreviousPath: "clusters/x.yaml"}}}
+
+	if !always.Applies(elsewhere) {
+		t.Error("a watch without paths applies to every PR")
+	}
+	if !scoped.Applies(inClusters) || scoped.Applies(elsewhere) {
+		t.Error("a scoped watch applies only when a file matches")
+	}
+	if !scoped.Applies(renamedOut) {
+		t.Error("a rename source counts as a match")
+	}
+}

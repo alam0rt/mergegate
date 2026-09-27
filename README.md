@@ -30,6 +30,7 @@ The steps run in order. The first one that decides wins.
 | 5 | A non-docs file has no patch (binary, or too big for GitHub to render) | review |
 | 6 | More than `max_changed_lines` added + removed | review |
 | 7 | Ask Jev (below) | auto-merge or review |
+| 8 | Any `watch` question (see [Watches](#watches-your-own-questions)) answers yes | review |
 
 Jev gets the title and the per-file diffs. It never sees the PR description,
 which is free text that states intent rather than showing the change. All six
@@ -83,6 +84,34 @@ max_changed_lines: 400
 allowed_authors: ["renovate[bot]"]   # empty = anyone
 thresholds: {yes: 0.9, no: 0.1, confidence: 0.6}
 ```
+
+### Watches: your own questions
+
+A watch is an extra yes/no question for Jev, phrased so that **yes means a human
+should look**. Use it for domain knowledge the built-in questions can't have:
+an app whose upgrades need a manual step, a setting you've been burned by, and
+so on.
+
+```yaml
+watch:
+  - id: ingress_snippets              # [a-z][a-z0-9_]*, unique
+    question: "Does this diff add or enable nginx configuration-snippet or server-snippet annotations?"
+  - id: headscale
+    question: "Does this diff change the headscale container image or its version?"
+    paths: ["clusters/**"]            # optional: ask only when a changed file matches
+    threshold: 0.5                    # optional: review if p(yes) > this; default thresholds.no
+```
+
+- A watch can only **veto**. A PR that fails a built-in check stays in review
+  however its watches answer, and a watch with no answer counts as tripped.
+- Watches go out in the same request as the built-in questions, and each is
+  answered on its own. Each one adds roughly $0.00002 per PR.
+- They apply only to PRs that reach the model. Docs-only and protected-path
+  PRs are settled by path first. For a hard rule, use `protected_paths`.
+- Ask about one thing per watch, and phrase it about what the diff *shows*
+  ("does this change X"), not about intent or future risk.
+- Passing watches are listed with their values (`watches quiet:
+  headscale=0.02`), so you can see how close each one came.
 
 Default protected paths are `.mergegate.yaml`, `.github/workflows/**`,
 `.github/actions/**` and `**/CODEOWNERS`. See

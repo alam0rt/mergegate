@@ -5,6 +5,8 @@ package judge
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"time"
 
 	openrouter "github.com/OpenRouterTeam/go-sdk"
@@ -65,6 +67,9 @@ type Assessment struct {
 	Kind              string
 	KindConfidence    float64
 	KindProbabilities map[string]float64
+
+	// Watches holds p(yes) for each repo-specific watch question, by watch ID.
+	Watches map[string]float64
 
 	Model string
 	Cost  float64
@@ -150,9 +155,19 @@ func State(pr mergegate.PullRequest) map[string]any {
 	}
 }
 
-func questions() map[string]components.Questions {
-	qs := make(map[string]components.Questions, len(nouls)+1)
+// watchPrefix namespaces watch IDs so they cannot collide with built-in questions.
+const watchPrefix = "watch_"
+
+func questions(extra map[string]string) map[string]components.Questions {
+	qs := make(map[string]components.Questions, len(nouls)+len(extra)+1)
+	all := make(map[string]string, len(nouls)+len(extra))
 	for id, text := range nouls {
+		all[id] = text
+	}
+	for id, text := range extra {
+		all[watchPrefix+id] = text
+	}
+	for id, text := range all {
 		qs[id] = components.CreateQuestionsNoul(components.DecisionsNoulQuestion{
 			Instructions: components.CreateDecisionsNoulQuestionInstructionsStr(text),
 		})
@@ -169,12 +184,14 @@ func questions() map[string]components.Questions {
 	return qs
 }
 
-// Assess asks Jev every question about pr in a single request.
-func (j *Judge) Assess(ctx context.Context, pr mergegate.PullRequest) (Assessment, error) {
+// Assess asks Jev every question about pr in a single request. extra maps
+// watch IDs to additional yes/no questions; their answers land in
+// Assessment.Watches.
+func (j *Judge) Assess(ctx context.Context, pr mergegate.PullRequest, extra map[string]string) (Assessment, error) {
 	resp, err := j.sdk.Alpha.Decisions.Create(ctx, components.DecisionsRequest{
 		Model:     j.model,
 		State:     components.CreateStateMapOfAny(State(pr)),
-		Questions: questions(),
+		Questions: questions(extra),
 	}, j.callOpts...)
 	if err != nil {
 		return Assessment{}, fmt.Errorf("jev decisions: %w", err)
@@ -184,19 +201,30 @@ func (j *Judge) Assess(ctx context.Context, pr mergegate.PullRequest) (Assessmen
 	if resp.Usage.Cost != nil {
 		a.Cost = *resp.Usage.Cost
 	}
-	targets := map[string]*float64{
-		QDocsOnly: &a.DocsOnly, QVersionBump: &a.VersionBump, QMajorBump: &a.MajorBump,
-		QOtherChanges: &a.OtherChanges, QRemoval: &a.Removal,
+	// A slice, not a map, so a missing answer is always reported the same way.
+	targets := []struct {
+		id  string
+		dst *float64
+	}{
+		{QDocsOnly, &a.DocsOnly}, {QVersionBump, &a.VersionBump}, {QMajorBump, &a.MajorBump},
+		{QOtherChanges, &a.OtherChanges}, {QRemoval, &a.Removal},
 	}
-	for id, dst := range targets {
-		ans, ok := resp.Answers[id]
-		if !ok {
-			return Assessment{}, fmt.Errorf("jev returned no answer for %q", id)
+	for _, t := range targets {
+		p, err := noul(resp.Answers, t.id)
+		if err != nil {
+			return Assessment{}, err
 		}
-		if ans.DecisionsNoulAnswer == nil || ans.Type != components.AnswersTypeNoul {
-			return Assessment{}, fmt.Errorf("jev answered %q with type %q, want noul", id, ans.Type)
+		*t.dst = p
+	}
+	if len(extra) > 0 {
+		a.Watches = make(map[string]float64, len(extra))
+	}
+	for _, id := range slices.Sorted(maps.Keys(extra)) {
+		p, err := noul(resp.Answers, watchPrefix+id)
+		if err != nil {
+			return Assessment{}, err
 		}
-		*dst = ans.DecisionsNoulAnswer.Noul
+		a.Watches[id] = p
 	}
 
 	kind, ok := resp.Answers[QKind]
@@ -212,4 +240,16 @@ func (j *Judge) Assess(ctx context.Context, pr mergegate.PullRequest) (Assessmen
 		a.KindConfidence = *c
 	}
 	return a, nil
+}
+
+// noul returns the probability from the noul answer to question id.
+func noul(answers map[string]components.Answers, id string) (float64, error) {
+	ans, ok := answers[id]
+	if !ok {
+		return 0, fmt.Errorf("jev returned no answer for %q", id)
+	}
+	if ans.DecisionsNoulAnswer == nil || ans.Type != components.AnswersTypeNoul {
+		return 0, fmt.Errorf("jev answered %q with type %q, want noul", id, ans.Type)
+	}
+	return ans.DecisionsNoulAnswer.Noul, nil
 }

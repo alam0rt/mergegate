@@ -15,10 +15,12 @@ type fakeAssessor struct {
 	a     judge.Assessment
 	err   error
 	calls int
+	extra map[string]string
 }
 
-func (f *fakeAssessor) Assess(context.Context, mergegate.PullRequest) (judge.Assessment, error) {
+func (f *fakeAssessor) Assess(_ context.Context, _ mergegate.PullRequest, extra map[string]string) (judge.Assessment, error) {
 	f.calls++
+	f.extra = extra
 	return f.a, f.err
 }
 
@@ -161,4 +163,80 @@ func TestModelErrorIsNotAMerge(t *testing.T) {
 	if v.AutoMerge {
 		t.Error("an error must never produce AutoMerge")
 	}
+}
+
+func TestWatches(t *testing.T) {
+	limit := 0.3
+	cfg := rules.Default()
+	cfg.Watches = []rules.Watch{
+		{ID: "snippets", Question: "Adds nginx snippets?", Threshold: &limit},
+		{ID: "strict", Question: "Touches the database?"}, // default limit: thresholds.no
+		{ID: "elsewhere", Question: "q", Paths: []string{"apps/**"}},
+	}
+	withWatches := func(w map[string]float64) judge.Assessment {
+		a := safeBump
+		a.Watches = w
+		return a
+	}
+	cases := []struct {
+		name      string
+		watches   map[string]float64
+		autoMerge bool
+		reason    string
+	}{
+		{"all quiet", map[string]float64{"snippets": 0.29, "strict": 0.05}, true, "dependency_patch"},
+		{"custom threshold trips", map[string]float64{"snippets": 0.31, "strict": 0.05}, false, "watch snippets"},
+		{"default threshold trips", map[string]float64{"snippets": 0.0, "strict": 0.2}, false, "watch strict"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := &fakeAssessor{a: withWatches(c.watches)}
+			v, err := Evaluate(context.Background(), cfg, pr("clusters/omar/app.yaml"), f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v.AutoMerge != c.autoMerge {
+				t.Errorf("AutoMerge = %v, want %v (reasons %q)", v.AutoMerge, c.autoMerge, v.Reasons)
+			}
+			wantReason(t, v, c.reason)
+			want := map[string]string{"snippets": "Adds nginx snippets?", "strict": "Touches the database?"}
+			if len(f.extra) != len(want) || f.extra["snippets"] != want["snippets"] || f.extra["strict"] != want["strict"] {
+				t.Errorf("asked %v, want only the watches whose paths match", f.extra)
+			}
+		})
+	}
+}
+
+// Watches narrow what can merge; they can never turn a review into a merge.
+func TestWatchesCannotApprove(t *testing.T) {
+	cfg := rules.Default()
+	cfg.Watches = []rules.Watch{{ID: "fine", Question: "q"}}
+	a := safeBump
+	a.MajorBump = 0.9
+	a.Watches = map[string]float64{"fine": 0}
+	v, _ := run(t, cfg, pr("clusters/omar/app.yaml"), a)
+	if v.AutoMerge {
+		t.Error("a passing watch must not override a failing built-in check")
+	}
+}
+
+// Docs-only PRs are settled by path before the model is asked anything, so
+// watches do not apply to them.
+func TestWatchesSkipDocsOnly(t *testing.T) {
+	cfg := rules.Default()
+	cfg.Watches = []rules.Watch{{ID: "w", Question: "q"}}
+	v, calls := run(t, cfg, pr("README.md"), safeBump)
+	if !v.AutoMerge || calls != 0 {
+		t.Errorf("AutoMerge=%v calls=%d, want true and 0", v.AutoMerge, calls)
+	}
+}
+
+func TestMissingWatchAnswerIsNotAMerge(t *testing.T) {
+	cfg := rules.Default()
+	cfg.Watches = []rules.Watch{{ID: "w", Question: "q"}}
+	v, _ := run(t, cfg, pr("clusters/omar/app.yaml"), safeBump) // safeBump has no Watches
+	if v.AutoMerge {
+		t.Error("a watch with no answer must fail closed")
+	}
+	wantReason(t, v, "watch w")
 }
