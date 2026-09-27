@@ -1,0 +1,105 @@
+# mergegate: auto-merge PRs that are safe to merge without review.
+# Variant for repos without branch protection (e.g. private repos on the free
+# plan), where `gh pr merge --auto` is unavailable: wait for the other checks
+# on the judged commit, then merge exactly that commit.
+# See github.com/alam0rt/mergegate.
+name: mergegate
+
+on:
+  # _target: the workflow and .mergegate.yaml come from the base branch, so a
+  # PR cannot change the rules it is judged by. This workflow must never
+  # check out or run PR code; mergegate reads the PR only through the API.
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, dismissed]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+
+concurrency:
+  group: mergegate-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  mergegate:
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request &&
+       (contains(github.event.comment.body, '/hold') || contains(github.event.comment.body, '/unhold')))
+    runs-on: ubuntu-latest
+    env:
+      # Pin to a commit SHA; the init skill fills this in.
+      MERGEGATE_REF: latest
+      # squash, merge or rebase: whichever this repo allows.
+      MERGE_METHOD: squash
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+    steps:
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Gate
+        id: gate
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -uo pipefail
+          # Install rather than `go run`: go run turns exit 2 into 1.
+          GOBIN="$RUNNER_TEMP/bin" go install "github.com/alam0rt/mergegate/cmd/mergegate@${MERGEGATE_REF}" || exit 1
+          "$RUNNER_TEMP/bin/mergegate" -json "${GITHUB_REPOSITORY}#${PR}" > verdict.json
+          code=$?
+          {
+            echo '### mergegate'
+            jq -r '.[0] // empty | (if .auto_merge then "**auto-merge**" else "**needs review**" end), (.reasons[] | "- " + .)' verdict.json
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          # The commit that was judged; only this commit may be merged.
+          echo "sha=$(jq -r '.[0].head_sha // empty' verdict.json)" >> "$GITHUB_OUTPUT"
+          case $code in 0|2) ;; *) exit "$code" ;; esac
+
+      - name: Wait for the other checks on the judged commit
+        if: steps.gate.outputs.code == '0'
+        env:
+          SHA: ${{ steps.gate.outputs.sha }}
+          SELF: ${{ github.job }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 90); do
+            runs="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs?per_page=100" \
+                     --jq "[.check_runs[] | select(.name != \"${SELF}\")]")"
+            statuses="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/status" --jq '{state, total_count}')"
+            failed="$(jq -r '[.[] | select(.status == "completed" and (.conclusion | IN("success","neutral","skipped") | not)) | .name] | join(", ")' <<<"$runs")"
+            if [ -n "$failed" ] || [ "$(jq -r .state <<<"$statuses")" = failure ] || [ "$(jq -r .state <<<"$statuses")" = error ]; then
+              echo "::error::checks failed (${failed:-commit status}); not merging"
+              exit 1
+            fi
+            pending="$(jq '[.[] | select(.status != "completed")] | length' <<<"$runs")"
+            [ "$(jq -r '.total_count' <<<"$statuses")" -gt 0 ] && [ "$(jq -r .state <<<"$statuses")" = pending ] && pending=$((pending + 1))
+            total="$(jq length <<<"$runs")"
+            # Give other workflows a minute to register before trusting "none".
+            if [ "$pending" -eq 0 ] && { [ "$total" -gt 0 ] || [ "$i" -ge 4 ]; }; then
+              echo "All ${total} other checks passed."
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::checks did not finish within 30 minutes; not merging"
+          exit 1
+
+      - name: Merge
+        if: steps.gate.outputs.code == '0'
+        env:
+          SHA: ${{ steps.gate.outputs.sha }}
+        run: |
+          # --match-head-commit refuses the merge if the branch moved after the
+          # gate judged it; the new push brings its own run.
+          gh pr merge "$PR" --"$MERGE_METHOD" --match-head-commit "$SHA"

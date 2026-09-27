@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "mergegate",
+  "description": "Claude Code plugin for mergegate, the PR auto-merge gate.",
+  "owner": {
+    "name": "alam0rt"
+  },
+  "plugins": [
+    {
+      "name": "mergegate",
+      "description": "Set up or tune mergegate in the current GitHub repository.",
+      "source": "./plugin",
+      "category": "development",
+      "homepage": "https://github.com/alam0rt/mergegate"
+    }
+  ]
+}

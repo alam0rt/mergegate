@@ -1,0 +1,72 @@
+# mergegate: auto-merge PRs that are safe to merge without review.
+# Variant for repos with branch protection and "Allow auto-merge" enabled:
+# the merge waits for your required checks. See github.com/alam0rt/mergegate.
+name: mergegate
+
+on:
+  # _target: the workflow and .mergegate.yaml come from the base branch, so a
+  # PR cannot change the rules it is judged by. This workflow must never
+  # check out or run PR code; mergegate reads the PR only through the API.
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  # Re-judge when someone reviews or writes /hold or /unhold.
+  pull_request_review:
+    types: [submitted, dismissed]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: mergegate-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  mergegate:
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request &&
+       (contains(github.event.comment.body, '/hold') || contains(github.event.comment.body, '/unhold')))
+    runs-on: ubuntu-latest
+    env:
+      # Pin to a commit SHA; the init skill fills this in.
+      MERGEGATE_REF: latest
+      # squash, merge or rebase: whichever this repo allows.
+      MERGE_METHOD: squash
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+    steps:
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Gate
+        id: gate
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -uo pipefail
+          # Install rather than `go run`: go run turns exit 2 into 1.
+          GOBIN="$RUNNER_TEMP/bin" go install "github.com/alam0rt/mergegate/cmd/mergegate@${MERGEGATE_REF}" || exit 1
+          "$RUNNER_TEMP/bin/mergegate" -json "${GITHUB_REPOSITORY}#${PR}" > verdict.json
+          code=$?
+          {
+            echo '### mergegate'
+            jq -r '.[0] // empty | (if .auto_merge then "**auto-merge**" else "**needs review**" end), (.reasons[] | "- " + .)' verdict.json
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+      - name: Merge or hold
+        run: |
+          # 0 = safe: enable auto-merge (it still waits for required checks).
+          # 2 = needs review, 1 = error: cancel any auto-merge set earlier.
+          if [ "${{ steps.gate.outputs.code }}" = 0 ]; then
+            gh pr merge "$PR" --auto --"$MERGE_METHOD"
+          else
+            gh pr merge "$PR" --disable-auto 2>/dev/null || true
+            [ "${{ steps.gate.outputs.code }}" = 2 ] || exit 1
+          fi

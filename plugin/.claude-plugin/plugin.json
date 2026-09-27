@@ -1,0 +1,10 @@
+{
+  "name": "mergegate",
+  "version": "0.1.0",
+  "description": "Set up mergegate in a GitHub repo: survey it, write a minimal .mergegate.yaml, backtest on recent PRs, and add the auto-merge workflow.",
+  "author": {
+    "name": "alam0rt"
+  },
+  "homepage": "https://github.com/alam0rt/mergegate",
+  "repository": "https://github.com/alam0rt/mergegate"
+}
