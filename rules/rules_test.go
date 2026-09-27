@@ -160,13 +160,14 @@ watch:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Watches) != 2 {
-		t.Fatalf("got %d watches, want 2", len(cfg.Watches))
+	if len(cfg.Watches) != len(Default().Watches)+2 {
+		t.Fatalf("got %d watches, want the defaults plus 2", len(cfg.Watches))
 	}
-	if w := cfg.Watches[0]; w.ID != "ingress_snippets" || w.Limit(cfg.Thresholds) != 0.3 || len(w.Paths) != 1 {
+	n := len(Default().Watches)
+	if w := cfg.Watches[n]; w.ID != "ingress_snippets" || w.Limit(cfg.Thresholds) != 0.3 || len(w.Paths) != 1 {
 		t.Errorf("first watch = %+v", w)
 	}
-	if got := cfg.Watches[1].Limit(cfg.Thresholds); got != cfg.Thresholds.No {
+	if got := cfg.Watches[n+1].Limit(cfg.Thresholds); got != cfg.Thresholds.No {
 		t.Errorf("default limit = %v, want thresholds.no %v", got, cfg.Thresholds.No)
 	}
 }

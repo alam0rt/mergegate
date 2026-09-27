@@ -9,6 +9,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"flag"
@@ -16,6 +17,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 
 	"github.com/alam0rt/mergegate"
@@ -23,6 +25,7 @@ import (
 	"github.com/alam0rt/mergegate/github"
 	"github.com/alam0rt/mergegate/judge"
 	"github.com/alam0rt/mergegate/rules"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -35,6 +38,7 @@ const (
 type source interface {
 	PullRequest(ctx context.Context, repo string, n int) (mergegate.PullRequest, error)
 	ConfigFile(ctx context.Context, repo, ref string) ([]byte, error)
+	History(ctx context.Context, repo, ref string, paths []string, n int, changedFilesOnly bool) ([]mergegate.Commit, error)
 }
 
 type result struct {
@@ -73,15 +77,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, src sourc
 	asJSON := fs.Bool("json", false, "print results as JSON")
 	cfgPath := fs.String("config", "", "local config file (default: "+github.ConfigPath+" from each PR's base branch)")
 	model := fs.String("model", judge.DefaultModel, "Jev model to use")
+	printConfig := fs.Bool("print-config", false, "print the effective config (defaults, or -config layered over them) as YAML and exit")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: mergegate [flags] owner/repo#N|PR-URL ...")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
-		return exitError
-	}
-	if fs.NArg() == 0 {
-		fs.Usage()
 		return exitError
 	}
 
@@ -99,6 +100,25 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, src sourc
 			return exitError
 		}
 		local = &cfg
+	}
+	if *printConfig {
+		cfg := rules.Default()
+		if local != nil {
+			cfg = *local
+		}
+		fmt.Fprintln(stdout, "# mergegate config. Every key is optional; anything left out keeps its default.")
+		fmt.Fprintln(stdout, "# protected_paths and watch entries merge with the defaults (watch by id; `disabled: true` removes one).")
+		enc := yaml.NewEncoder(stdout)
+		enc.SetIndent(2)
+		if err := enc.Encode(cfg); err != nil {
+			fmt.Fprintln(stderr, err)
+			return exitError
+		}
+		return exitMerge
+	}
+	if fs.NArg() == 0 {
+		fs.Usage()
+		return exitError
 	}
 
 	assessor := newAssessor(*model)
@@ -152,6 +172,16 @@ func evaluate(ctx context.Context, ref string, local *rules.Config, src source, 
 			}
 		}
 	}
+	if usesHistory(cfg) {
+		var paths []string
+		for _, f := range pr.Files {
+			paths = append(paths, f.Path)
+		}
+		h := cfg.Context.History
+		if pr.History, err = src.History(ctx, repo, cmp.Or(pr.BaseSHA, pr.BaseRef), paths, h.Commits, h.ChangedFilesOnly); err != nil {
+			return result{}, err
+		}
+	}
 	v, err := gate.Evaluate(ctx, cfg, pr, assessor)
 	if err != nil {
 		return result{}, err
@@ -171,4 +201,17 @@ func printText(w io.Writer, r result) {
 	for _, reason := range r.Reasons {
 		fmt.Fprintf(w, "\t- %s\n", reason)
 	}
+}
+
+// usesHistory reports whether any watch will read base-branch history.
+func usesHistory(cfg rules.Config) bool {
+	if !cfg.Context.Enabled(rules.SourceHistory) {
+		return false
+	}
+	for _, w := range cfg.Watches {
+		if slices.Contains(w.Uses, rules.SourceHistory) {
+			return true
+		}
+	}
+	return false
 }

@@ -7,18 +7,23 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/alam0rt/mergegate"
 	"github.com/alam0rt/mergegate/gate"
 	"github.com/alam0rt/mergegate/judge"
+	"github.com/alam0rt/mergegate/rules"
 )
 
 type fakeSource struct {
 	prs     map[int]mergegate.PullRequest
 	config  []byte
 	cfgRefs []string
+
+	historyCalls int
+	historyRef   string
 }
 
 func (f *fakeSource) PullRequest(_ context.Context, repo string, n int) (mergegate.PullRequest, error) {
@@ -30,12 +35,22 @@ func (f *fakeSource) PullRequest(_ context.Context, repo string, n int) (mergega
 	return pr, nil
 }
 
+func (f *fakeSource) History(_ context.Context, repo, ref string, paths []string, n int, changedOnly bool) ([]mergegate.Commit, error) {
+	f.historyCalls++
+	f.historyRef = ref
+	return []mergegate.Commit{{SHA: "c1", Message: "Revert"}}, nil
+}
+
 func (f *fakeSource) ConfigFile(_ context.Context, repo, ref string) ([]byte, error) {
 	f.cfgRefs = append(f.cfgRefs, ref)
 	return f.config, nil
 }
 
 type fakeAssessor struct{ a judge.Assessment }
+
+func (f fakeAssessor) Ask(context.Context, map[string]any, map[string]string) (map[string]float64, error) {
+	return map[string]float64{"unresolved_concern": 0, "recent_revert": 0}, nil
+}
 
 func (f fakeAssessor) Assess(context.Context, mergegate.PullRequest, map[string]string) (judge.Assessment, error) {
 	return f.a, nil
@@ -143,5 +158,51 @@ func TestBadRepoConfigIsAnError(t *testing.T) {
 	src := &fakeSource{prs: map[int]mergegate.PullRequest{2: yamlPR()}, config: []byte("nope: 1\n")}
 	if code, _, stderr := runWith(t, src, "o/r#2"); code != 1 || !strings.Contains(stderr, "config") {
 		t.Errorf("exit %d, stderr %q; a broken config must fail closed", code, stderr)
+	}
+}
+
+func TestHistoryFetchedOnlyWhenUsed(t *testing.T) {
+	src := &fakeSource{prs: map[int]mergegate.PullRequest{2: yamlPR()}}
+	pr := yamlPR()
+	pr.BaseSHA = "base-at-open"
+	src.prs[2] = pr
+	runWith(t, src, "o/r#2")
+	if src.historyCalls != 1 {
+		t.Errorf("default config reads history: %d calls, want 1", src.historyCalls)
+	}
+	if src.historyRef != "base-at-open" {
+		t.Errorf("history read at %q, want the PR's base commit", src.historyRef)
+	}
+
+	src = &fakeSource{prs: map[int]mergegate.PullRequest{2: yamlPR()}, config: []byte("context: {history: {commits: 0}}\n")}
+	runWith(t, src, "o/r#2")
+	if src.historyCalls != 0 {
+		t.Errorf("history off: %d calls, want 0", src.historyCalls)
+	}
+}
+
+func TestPrintConfig(t *testing.T) {
+	code, out, _ := runWith(t, &fakeSource{}, "-print-config")
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	cfg, err := rules.Load(strings.NewReader(out))
+	if err != nil {
+		t.Fatalf("printed config does not load: %v\n%s", err, out)
+	}
+	if !reflect.DeepEqual(cfg, rules.Default()) {
+		t.Error("printed config should be exactly the defaults")
+	}
+	if !strings.HasPrefix(out, "#") {
+		t.Error("printed config should start with an explanatory comment")
+	}
+}
+
+func TestPrintConfigWithLocalFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gate.yaml")
+	os.WriteFile(path, []byte("max_changed_lines: 7\n"), 0o644)
+	_, out, _ := runWith(t, &fakeSource{}, "-config", path, "-print-config")
+	if !strings.Contains(out, "max_changed_lines: 7") {
+		t.Errorf("want the effective config, got:\n%s", out)
 	}
 }

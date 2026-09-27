@@ -10,7 +10,10 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/alam0rt/mergegate"
 )
@@ -60,10 +63,43 @@ type apiPR struct {
 	} `json:"user"`
 	Base struct {
 		Ref string `json:"ref"`
+		SHA string `json:"sha"`
 	} `json:"base"`
 	Head struct {
 		SHA string `json:"sha"`
 	} `json:"head"`
+	Labels []struct {
+		Name string `json:"name"`
+	} `json:"labels"`
+}
+
+type apiUser struct {
+	Login string `json:"login"`
+}
+
+type apiComment struct {
+	User        apiUser   `json:"user"`
+	Association string    `json:"author_association"`
+	Body        string    `json:"body"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type apiReview struct {
+	User        apiUser   `json:"user"`
+	Association string    `json:"author_association"`
+	State       string    `json:"state"`
+	Body        string    `json:"body"`
+	SubmittedAt time.Time `json:"submitted_at"`
+}
+
+type apiCommit struct {
+	SHA    string `json:"sha"`
+	Commit struct {
+		Message   string `json:"message"`
+		Committer struct {
+			Date time.Time `json:"date"`
+		} `json:"committer"`
+	} `json:"commit"`
 }
 
 type apiFile struct {
@@ -130,7 +166,10 @@ func (c *Client) PullRequest(ctx context.Context, repo string, number int) (merg
 	pr := mergegate.PullRequest{
 		Repo: repo, Number: p.Number, Title: p.Title, Body: p.Body, Draft: p.Draft,
 		Author: p.User.Login, IsBot: p.User.Type == "Bot",
-		BaseRef: p.Base.Ref, HeadSHA: p.Head.SHA,
+		BaseRef: p.Base.Ref, BaseSHA: p.Base.SHA, HeadSHA: p.Head.SHA,
+	}
+	for _, l := range p.Labels {
+		pr.Labels = append(pr.Labels, l.Name)
 	}
 
 	next := base + "/files?per_page=100&page=1"
@@ -150,6 +189,11 @@ func (c *Client) PullRequest(ctx context.Context, repo string, number int) (merg
 			})
 		}
 	}
+
+	pr.Comments, pr.Reviews, err = c.discussion(ctx, repo, number)
+	if err != nil {
+		return mergegate.PullRequest{}, fmt.Errorf("%s#%d: %w", repo, number, err)
+	}
 	return pr, nil
 }
 
@@ -164,4 +208,102 @@ func (c *Client) ConfigFile(ctx context.Context, repo, ref string) ([]byte, erro
 		return nil, fmt.Errorf("fetch %s: %w", ConfigPath, err)
 	}
 	return body, nil
+}
+
+// getAll fetches every page of a JSON array endpoint.
+func getAll[T any](ctx context.Context, c *Client, u string) ([]T, error) {
+	var all []T
+	for u != "" {
+		body, next, err := c.get(ctx, u, "application/vnd.github+json")
+		if err != nil {
+			return nil, err
+		}
+		var page []T
+		if err := json.Unmarshal(body, &page); err != nil {
+			return nil, fmt.Errorf("decode %s: %w", u, err)
+		}
+		all = append(all, page...)
+		u = next
+	}
+	return all, nil
+}
+
+// discussion fetches conversation comments, reviews and inline review
+// comments. Review bodies are folded into the comments so the conversation
+// reads in order.
+func (c *Client) discussion(ctx context.Context, repo string, number int) ([]mergegate.Comment, []mergegate.Review, error) {
+	issue, err := getAll[apiComment](ctx, c, fmt.Sprintf("%s/repos/%s/issues/%d/comments?per_page=100", c.BaseURL, repo, number))
+	if err != nil {
+		return nil, nil, fmt.Errorf("fetch comments: %w", err)
+	}
+	reviews, err := getAll[apiReview](ctx, c, fmt.Sprintf("%s/repos/%s/pulls/%d/reviews?per_page=100", c.BaseURL, repo, number))
+	if err != nil {
+		return nil, nil, fmt.Errorf("fetch reviews: %w", err)
+	}
+	inline, err := getAll[apiComment](ctx, c, fmt.Sprintf("%s/repos/%s/pulls/%d/comments?per_page=100", c.BaseURL, repo, number))
+	if err != nil {
+		return nil, nil, fmt.Errorf("fetch review comments: %w", err)
+	}
+
+	var comments []mergegate.Comment
+	add := func(kind string, cm apiComment) {
+		comments = append(comments, mergegate.Comment{
+			Author: cm.User.Login, Association: cm.Association, Body: cm.Body, Kind: kind, CreatedAt: cm.CreatedAt,
+		})
+	}
+	for _, cm := range issue {
+		add("comment", cm)
+	}
+	for _, cm := range inline {
+		add("review_comment", cm)
+	}
+	var rs []mergegate.Review
+	for _, r := range reviews {
+		rs = append(rs, mergegate.Review{Author: r.User.Login, Association: r.Association, State: r.State, SubmittedAt: r.SubmittedAt})
+		if strings.TrimSpace(r.Body) != "" {
+			add("review", apiComment{User: r.User, Association: r.Association, Body: r.Body, CreatedAt: r.SubmittedAt})
+		}
+	}
+	slices.SortStableFunc(comments, func(a, b mergegate.Comment) int { return a.CreatedAt.Compare(b.CreatedAt) })
+	slices.SortStableFunc(rs, func(a, b mergegate.Review) int { return a.SubmittedAt.Compare(b.SubmittedAt) })
+	return comments, rs, nil
+}
+
+// maxHistoryPaths caps the per-file history requests for very wide PRs.
+const maxHistoryPaths = 20
+
+// History returns up to n recent commits on ref, newest first. With
+// changedFilesOnly, only commits touching paths count.
+func (c *Client) History(ctx context.Context, repo, ref string, paths []string, n int, changedFilesOnly bool) ([]mergegate.Commit, error) {
+	base := fmt.Sprintf("%s/repos/%s/commits?sha=%s&per_page=%d", c.BaseURL, repo, url.QueryEscape(ref), n)
+	var urls []string
+	if !changedFilesOnly || len(paths) == 0 {
+		urls = []string{base}
+	} else {
+		for _, p := range paths[:min(len(paths), maxHistoryPaths)] {
+			urls = append(urls, base+"&path="+url.QueryEscape(p))
+		}
+	}
+
+	seen := map[string]bool{}
+	var out []mergegate.Commit
+	for _, u := range urls {
+		// One page is enough: each request already asks for n commits.
+		body, _, err := c.get(ctx, u, "application/vnd.github+json")
+		if err != nil {
+			return nil, fmt.Errorf("fetch history: %w", err)
+		}
+		var page []apiCommit
+		if err := json.Unmarshal(body, &page); err != nil {
+			return nil, fmt.Errorf("decode history: %w", err)
+		}
+		for _, cm := range page {
+			if !seen[cm.SHA] {
+				seen[cm.SHA] = true
+				out = append(out, mergegate.Commit{SHA: cm.SHA, Message: cm.Commit.Message, Date: cm.Commit.Committer.Date})
+			}
+		}
+	}
+	slices.SortStableFunc(out, func(a, b mergegate.Commit) int { return b.Date.Compare(a.Date) })
+	return out[:min(len(out), n)], nil
 }

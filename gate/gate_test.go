@@ -11,11 +11,29 @@ import (
 	"github.com/alam0rt/mergegate/rules"
 )
 
+type askCall struct {
+	state   map[string]any
+	watches map[string]string
+}
+
 type fakeAssessor struct {
 	a     judge.Assessment
 	err   error
 	calls int
 	extra map[string]string
+
+	ask    map[string]float64 // answers for Ask, by watch ID
+	askErr error
+	asks   []askCall
+}
+
+func (f *fakeAssessor) Ask(_ context.Context, state map[string]any, watches map[string]string) (map[string]float64, error) {
+	f.asks = append(f.asks, askCall{state, watches})
+	out := map[string]float64{}
+	for id := range watches {
+		out[id] = f.ask[id]
+	}
+	return out, f.askErr
 }
 
 func (f *fakeAssessor) Assess(_ context.Context, _ mergegate.PullRequest, extra map[string]string) (judge.Assessment, error) {

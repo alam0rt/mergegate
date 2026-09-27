@@ -5,6 +5,8 @@ package gate
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/alam0rt/mergegate"
@@ -14,7 +16,10 @@ import (
 
 // Assessor is anything that can answer the judge's questions about a PR.
 type Assessor interface {
+	// Assess asks the built-in questions, plus extra watches, about the diff.
 	Assess(ctx context.Context, pr mergegate.PullRequest, extra map[string]string) (judge.Assessment, error)
+	// Ask asks only the given watches against an arbitrary state.
+	Ask(ctx context.Context, state map[string]any, watches map[string]string) (map[string]float64, error)
 }
 
 // Verdict is the gate's decision. AutoMerge is false unless every check
@@ -31,6 +36,10 @@ var bumpKinds = map[string]bool{"dependency_patch": true, "dependency_minor": tr
 
 // Evaluate decides whether pr can merge without review. The model is only
 // consulted when the deterministic rules cannot decide on their own.
+//
+// Only the diff can approve a merge. Comments and history are read solely
+// by watches, which can only veto, and each distinct set of sources is
+// asked in its own request so text from one cannot sway another.
 func Evaluate(ctx context.Context, cfg rules.Config, pr mergegate.PullRequest, assessor Assessor) (Verdict, error) {
 	facts := rules.Check(cfg, pr)
 	v := Verdict{Facts: facts}
@@ -44,6 +53,8 @@ func Evaluate(ctx context.Context, cfg rules.Config, pr mergegate.PullRequest, a
 		return human("pull request is a draft")
 	case !facts.AuthorAllowed:
 		return human("author %s is not in allowed_authors", pr.Author)
+	case len(facts.Held) > 0:
+		return human("on hold: %s", strings.Join(facts.Held, "; "))
 	case len(facts.Protected) > 0:
 		return human("touches protected paths: %s", strings.Join(facts.Protected, ", "))
 	case facts.DocsOnly:
@@ -53,32 +64,110 @@ func Evaluate(ctx context.Context, cfg rules.Config, pr mergegate.PullRequest, a
 		return human("no diff available for: %s", strings.Join(facts.Unreadable, ", "))
 	case facts.TooLarge:
 		return human("%d changed lines exceeds max_changed_lines %d", pr.ChangedLines(), cfg.MaxChangedLines)
+	case len(facts.RiskyVersions) > 0:
+		return human("version change needs review: %s", strings.Join(facts.RiskyVersions, "; "))
 	}
 
-	var watches []rules.Watch
-	var extra map[string]string
+	// Split applicable watches: plain ones ride along with the built-in
+	// questions; ones that read context are grouped by the sources they use.
+	var plain []rules.Watch
+	groups := map[string][]rules.Watch{}
 	for _, w := range cfg.Watches {
-		if w.Applies(pr) {
-			watches = append(watches, w)
-			if extra == nil {
-				extra = map[string]string{}
-			}
-			extra[w.ID] = w.Question
+		if !w.Applies(pr) {
+			continue
+		}
+		if len(w.Uses) == 0 {
+			plain = append(plain, w)
+			continue
+		}
+		if key := sourceKey(cfg, w); key != "" {
+			groups[key] = append(groups[key], w)
 		}
 	}
 
-	a, err := assessor.Assess(ctx, pr, extra)
+	a, err := assessor.Assess(ctx, pr, questions(plain))
 	if err != nil {
 		return v, err
 	}
 	v.Assessment = &a
 	v.AutoMerge, v.Reasons = decide(cfg.Thresholds, a)
-
-	// Watches run after decide and can only veto: a quiet watch never
-	// rescues a PR that failed a built-in check.
 	var quiet []string
-	for _, w := range watches {
-		p, ok := a.Watches[w.ID]
+	veto(cfg, plain, a.Watches, &v, &quiet)
+
+	// Context calls cost money and can only veto, so skip them once the
+	// answer is already "review".
+	if v.AutoMerge {
+		comments := rules.TrustedComments(cfg, pr)
+		for _, key := range slices.Sorted(maps.Keys(groups)) {
+			var cs []mergegate.Comment
+			var hs []mergegate.Commit
+			for _, s := range strings.Split(key, "+") {
+				switch s {
+				case rules.SourceComments:
+					cs = comments
+				case rules.SourceHistory:
+					hs = pr.History
+				}
+			}
+			if len(cs) == 0 && len(hs) == 0 {
+				continue // nothing to read, so nothing to find
+			}
+			if len(cs) == 0 {
+				cs = nil
+			}
+			if len(hs) == 0 {
+				hs = nil
+			}
+			answers, err := assessor.Ask(ctx, judge.ContextState(pr, cs, hs), questions(groups[key]))
+			if err != nil {
+				v.AutoMerge = false
+				return v, err
+			}
+			if a.Watches == nil {
+				a.Watches = map[string]float64{}
+			}
+			for id, p := range answers {
+				a.Watches[id] = p
+			}
+			veto(cfg, groups[key], answers, &v, &quiet)
+		}
+	}
+
+	if v.AutoMerge && len(quiet) > 0 {
+		v.Reasons = append(v.Reasons, "watches quiet: "+strings.Join(quiet, ", "))
+	}
+	return v, nil
+}
+
+// sourceKey is the sorted, enabled sources a watch reads, joined with "+".
+// It is empty when every source the watch needs is turned off.
+func sourceKey(cfg rules.Config, w rules.Watch) string {
+	var on []string
+	for _, s := range w.Uses {
+		if cfg.Context.Enabled(s) && !slices.Contains(on, s) {
+			on = append(on, s)
+		}
+	}
+	slices.Sort(on)
+	return strings.Join(on, "+")
+}
+
+func questions(ws []rules.Watch) map[string]string {
+	if len(ws) == 0 {
+		return nil
+	}
+	q := make(map[string]string, len(ws))
+	for _, w := range ws {
+		q[w.ID] = w.Question
+	}
+	return q
+}
+
+// veto applies watch answers to v. A watch can only turn a merge into a
+// review, and a missing answer counts as tripped.
+func veto(cfg rules.Config, ws []rules.Watch, answers map[string]float64, v *Verdict, quiet *[]string) {
+	for _, w := range ws {
+		p, ok := answers[w.ID]
 		switch {
 		case !ok:
 			v.AutoMerge = false
@@ -87,13 +176,9 @@ func Evaluate(ctx context.Context, cfg rules.Config, pr mergegate.PullRequest, a
 			v.AutoMerge = false
 			v.Reasons = append(v.Reasons, fmt.Sprintf("watch %s: p=%.2f > %.2f (%s)", w.ID, p, w.Limit(cfg.Thresholds), w.Question))
 		default:
-			quiet = append(quiet, fmt.Sprintf("%s=%.2f", w.ID, p))
+			*quiet = append(*quiet, fmt.Sprintf("%s=%.2f", w.ID, p))
 		}
 	}
-	if v.AutoMerge && len(quiet) > 0 {
-		v.Reasons = append(v.Reasons, "watches quiet: "+strings.Join(quiet, ", "))
-	}
-	return v, nil
 }
 
 // decide applies the thresholds to Jev's answers. There are two ways to

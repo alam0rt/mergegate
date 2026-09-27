@@ -253,3 +253,81 @@ func noul(answers map[string]components.Answers, id string) (float64, error) {
 	}
 	return ans.DecisionsNoulAnswer.Noul, nil
 }
+
+// Size budgets for context text. Anything longer is cut and marked, so the
+// model knows it saw only part of it.
+const (
+	maxCommentChars = 2000
+	maxCommitChars  = 1000
+)
+
+func clip(s string, n int) (string, bool) {
+	if len(s) <= n {
+		return s, false
+	}
+	return s[:n], true
+}
+
+// ContextState is the diff state plus the given context sources. A nil
+// source is left out entirely.
+func ContextState(pr mergegate.PullRequest, comments []mergegate.Comment, history []mergegate.Commit) map[string]any {
+	s := State(pr)
+	if comments != nil {
+		cs := make([]any, 0, len(comments))
+		for _, c := range comments {
+			body, cut := clip(c.Body, maxCommentChars)
+			m := map[string]any{
+				"author": c.Author, "association": c.Association, "kind": c.Kind,
+				"created_at": c.CreatedAt.UTC().Format(time.RFC3339), "body": body,
+			}
+			if cut {
+				m["truncated"] = true
+			}
+			cs = append(cs, m)
+		}
+		s["comments"] = cs
+	}
+	if history != nil {
+		hs := make([]any, 0, len(history))
+		for _, c := range history {
+			msg, cut := clip(c.Message, maxCommitChars)
+			m := map[string]any{
+				"sha": c.SHA[:min(len(c.SHA), 12)], "date": c.Date.UTC().Format(time.RFC3339), "message": msg,
+			}
+			if cut {
+				m["truncated"] = true
+			}
+			hs = append(hs, m)
+		}
+		s["history"] = hs
+	}
+	return s
+}
+
+// Ask sends only the given watch questions against state and returns p(yes)
+// for each, keyed by watch ID.
+func (j *Judge) Ask(ctx context.Context, state map[string]any, watches map[string]string) (map[string]float64, error) {
+	qs := make(map[string]components.Questions, len(watches))
+	for id, text := range watches {
+		qs[watchPrefix+id] = components.CreateQuestionsNoul(components.DecisionsNoulQuestion{
+			Instructions: components.CreateDecisionsNoulQuestionInstructionsStr(text),
+		})
+	}
+	resp, err := j.sdk.Alpha.Decisions.Create(ctx, components.DecisionsRequest{
+		Model:     j.model,
+		State:     components.CreateStateMapOfAny(state),
+		Questions: qs,
+	}, j.callOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("jev decisions: %w", err)
+	}
+	out := make(map[string]float64, len(watches))
+	for _, id := range slices.Sorted(maps.Keys(watches)) {
+		p, err := noul(resp.Answers, watchPrefix+id)
+		if err != nil {
+			return nil, err
+		}
+		out[id] = p
+	}
+	return out, nil
+}
