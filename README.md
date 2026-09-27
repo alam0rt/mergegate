@@ -63,7 +63,8 @@ error never produces an auto-merge.
 ```sh
 export OPENROUTER_API_KEY=...        # needed only when step 7 runs
 export GITHUB_TOKEN=...              # or GH_TOKEN; falls back to `gh auth token`
-go run github.com/alam0rt/mergegate/cmd/mergegate@latest [-json] [-config FILE] [-model M] owner/repo#N|PR-URL ...
+go install github.com/alam0rt/mergegate/cmd/mergegate@latest
+mergegate [-json] [-config FILE] [-model M] owner/repo#N|PR-URL ...
 ```
 
 Exit status: `0` means every PR may auto-merge, `2` means at least one needs
@@ -98,10 +99,18 @@ bot-opened PRs, run the gate in the same job that opens the PR:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
-          if go run github.com/alam0rt/mergegate/cmd/mergegate@<commit> "$GITHUB_REPOSITORY#$PR"; then
+          GOBIN="$RUNNER_TEMP/bin" go install github.com/alam0rt/mergegate/cmd/mergegate@<commit>
+          if "$RUNNER_TEMP/bin/mergegate" "$GITHUB_REPOSITORY#$PR"; then
             gh pr merge "$PR" --auto --squash
           fi
 ```
+
+Install the tool and run the binary. `go run` reports any non-zero exit as 1,
+so "needs review" (2) would look like an error.
+
+Without branch protection (for example a private repo on the free plan),
+`--auto` is unavailable. Wait for your checks on the head commit yourself, then
+run `gh pr merge --match-head-commit <sha>`.
 
 `--auto` still waits for required status checks, so the gate adds to branch
 protection and doesn't replace it.
