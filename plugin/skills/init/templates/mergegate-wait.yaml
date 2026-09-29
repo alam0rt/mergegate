@@ -52,14 +52,16 @@ jobs:
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
-          set -uo pipefail
+          # Actions runs this under `bash -e`; turn -e off so exit 2 reaches
+          # `code=$?` instead of failing the step.
+          set +e -u
           # Install rather than `go run`: go run turns exit 2 into 1.
           GOBIN="$RUNNER_TEMP/bin" go install "github.com/alam0rt/mergegate/cmd/mergegate@${MERGEGATE_REF}" || exit 1
           "$RUNNER_TEMP/bin/mergegate" -json "${GITHUB_REPOSITORY}#${PR}" > verdict.json
           code=$?
           {
             echo '### mergegate'
-            jq -r '.[0] // empty | (if .auto_merge then "**auto-merge**" else "**needs review**" end), (.reasons[] | "- " + .)' verdict.json
+            jq -r '.[0] // empty | (if .auto_merge then "**auto-merge**" else "**needs review**" end), (.reasons[] | "- " + .), (.tripped // [] | .[] | select(.read) | "\n**\(.watch)** read:\n", (.read[] | "- `\(.)`"))' verdict.json
           } >> "$GITHUB_STEP_SUMMARY"
           echo "code=$code" >> "$GITHUB_OUTPUT"
           # The commit that was judged; only this commit may be merged.

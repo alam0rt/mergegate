@@ -206,3 +206,17 @@ func TestPrintConfigWithLocalFile(t *testing.T) {
 		t.Errorf("want the effective config, got:\n%s", out)
 	}
 }
+
+func TestPrintTextShowsWhatATrippedWatchRead(t *testing.T) {
+	var out bytes.Buffer
+	printText(&out, result{Repo: "o/r", Number: 1, Reasons: []string{"diff alone would auto-merge: jev", "watch recent_revert tripped: p=0.46 > 0.30 (q)"},
+		Tripped: []gate.Trip{{Watch: "recent_revert", P: 0.46, Limit: 0.3, Read: []string{"commit 19a87e4 2026-08-09 revert(velero): drop"}}}})
+	want := "o/r#1\tneeds review\n" +
+		"\t- diff alone would auto-merge: jev\n" +
+		"\t- watch recent_revert tripped: p=0.46 > 0.30 (q)\n" +
+		"\trecent_revert read:\n" +
+		"\t    commit 19a87e4 2026-08-09 revert(velero): drop\n"
+	if out.String() != want {
+		t.Errorf("got\n%s\nwant\n%s", out.String(), want)
+	}
+}

@@ -29,6 +29,18 @@ type Verdict struct {
 	Reasons    []string
 	Facts      rules.Facts
 	Assessment *judge.Assessment // nil when the model was not consulted
+	// Tripped lists the watches that sent the PR to review, with what each
+	// one read. Jev returns only a probability, so the context it was shown
+	// is the only way for a reader to see why it said yes.
+	Tripped []Trip
+}
+
+// Trip is a watch that vetoed a merge.
+type Trip struct {
+	Watch string   `json:"watch"`
+	P     float64  `json:"p"`
+	Limit float64  `json:"limit"`
+	Read  []string `json:"read,omitempty"` // context shown to Jev, one line per item
 }
 
 // bumpKinds are the change kinds that may merge through the version-bump path.
@@ -91,8 +103,9 @@ func Evaluate(ctx context.Context, cfg rules.Config, pr mergegate.PullRequest, a
 	}
 	v.Assessment = &a
 	v.AutoMerge, v.Reasons = decide(cfg.Thresholds, a)
+	diffPassed := v.AutoMerge
 	var quiet []string
-	veto(cfg, plain, a.Watches, &v, &quiet)
+	veto(cfg, plain, a.Watches, nil, &v, &quiet)
 
 	// Context calls cost money and can only veto, so skip them once the
 	// answer is already "review".
@@ -129,8 +142,14 @@ func Evaluate(ctx context.Context, cfg rules.Config, pr mergegate.PullRequest, a
 			for id, p := range answers {
 				a.Watches[id] = p
 			}
-			veto(cfg, groups[key], answers, &v, &quiet)
+			veto(cfg, groups[key], answers, evidence(cs, hs), &v, &quiet)
 		}
+	}
+
+	// A watch veto on a clean diff reads as if the diff were the problem
+	// unless it says otherwise.
+	if diffPassed && !v.AutoMerge {
+		v.Reasons[0] = "diff alone would auto-merge: " + v.Reasons[0]
 	}
 
 	if v.AutoMerge && len(quiet) > 0 {
@@ -164,21 +183,45 @@ func questions(ws []rules.Watch) map[string]string {
 }
 
 // veto applies watch answers to v. A watch can only turn a merge into a
-// review, and a missing answer counts as tripped.
-func veto(cfg rules.Config, ws []rules.Watch, answers map[string]float64, v *Verdict, quiet *[]string) {
+// review, and a missing answer counts as tripped. read is the context the
+// watches were shown, recorded on each trip.
+func veto(cfg rules.Config, ws []rules.Watch, answers map[string]float64, read []string, v *Verdict, quiet *[]string) {
 	for _, w := range ws {
 		p, ok := answers[w.ID]
+		limit := w.Limit(cfg.Thresholds)
 		switch {
 		case !ok:
 			v.AutoMerge = false
 			v.Reasons = append(v.Reasons, fmt.Sprintf("watch %s: no answer", w.ID))
-		case p > w.Limit(cfg.Thresholds):
+		case p > limit:
 			v.AutoMerge = false
-			v.Reasons = append(v.Reasons, fmt.Sprintf("watch %s: p=%.2f > %.2f (%s)", w.ID, p, w.Limit(cfg.Thresholds), w.Question))
+			v.Reasons = append(v.Reasons, fmt.Sprintf("watch %s tripped: p=%.2f > %.2f (%s)", w.ID, p, limit, w.Question))
+			v.Tripped = append(v.Tripped, Trip{Watch: w.ID, P: p, Limit: limit, Read: read})
 		default:
 			*quiet = append(*quiet, fmt.Sprintf("%s=%.2f", w.ID, p))
 		}
 	}
+}
+
+// evidence renders context sources one line each: commits as short SHA,
+// date and subject; comments as author, association and first line.
+func evidence(cs []mergegate.Comment, hs []mergegate.Commit) []string {
+	var out []string
+	for _, c := range hs {
+		out = append(out, fmt.Sprintf("commit %s %s %s", c.SHA[:min(len(c.SHA), 7)], c.Date.UTC().Format("2006-01-02"), firstLine(c.Message)))
+	}
+	for _, c := range cs {
+		out = append(out, fmt.Sprintf("%s by %s (%s) %s: %s", c.Kind, c.Author, c.Association, c.CreatedAt.UTC().Format("2006-01-02"), firstLine(c.Body)))
+	}
+	return out
+}
+
+func firstLine(s string) string {
+	s, _, _ = strings.Cut(strings.TrimSpace(s), "\n")
+	if len(s) > 100 {
+		s = s[:100] + "…"
+	}
+	return s
 }
 
 // decide applies the thresholds to Jev's answers. There are two ways to

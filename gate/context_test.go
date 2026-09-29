@@ -5,6 +5,7 @@ import (
 	"errors"
 	"maps"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -92,7 +93,14 @@ func TestContextWatchTrips(t *testing.T) {
 	if v.AutoMerge {
 		t.Error("a tripped history watch must send the PR to review")
 	}
-	wantReason(t, v, "watch recent_revert")
+	wantReason(t, v, "watch recent_revert tripped")
+	if !strings.HasPrefix(v.Reasons[0], "diff alone would auto-merge: ") {
+		t.Errorf("a veto on a clean diff should say the diff passed: %q", v.Reasons[0])
+	}
+	if len(v.Tripped) != 1 || v.Tripped[0].Watch != "recent_revert" ||
+		!slices.Equal(v.Tripped[0].Read, []string{`commit abc 0001-01-01 Revert "bump app to 1.2"`}) {
+		t.Errorf("trip should record the history it read: %+v", v.Tripped)
+	}
 }
 
 func TestEmptySourcesAreNotAsked(t *testing.T) {
