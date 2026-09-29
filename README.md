@@ -164,7 +164,7 @@ should look**. Two ship by default:
 | ID | Reads | Asks | Limit |
 |----|-------|------|-------|
 | `unresolved_concern` | comments | Did a maintainer raise a concern or ask to wait, still unresolved? | 0.3 |
-| `recent_revert` | history | Was something this PR changes recently reverted, rolled back or pinned? | 0.3 |
+| `recent_revert` | history | Was the same dependency, image or setting this PR changes recently reverted, rolled back or pinned? A revert of something else in the same file doesn't count. | 0.3 |
 
 Add your own for knowledge the built-in questions can't have: an app whose
 upgrades need a manual step, a setting you've been burned by, and so on.
@@ -199,6 +199,18 @@ watch:
   ("does this change X"), not about intent or future risk.
 - Passing watches are listed with their values (`watches quiet:
   recent_revert=0.07`), so you can see how close each one came.
+- A tripped watch lists what it read under the reasons, since Jev returns
+  only a probability. If the diff itself passed, the first reason starts
+  with `diff alone would auto-merge:`, so it's clear the watch held it:
+
+  ```console
+  o/r#225	needs review
+  	- diff alone would auto-merge: jev: dependency_patch (p(bump)=0.96, ...)
+  	- watch recent_revert tripped: p=0.46 > 0.30 (Does the recent history show ...?)
+  	recent_revert read:
+  	    commit bb76797 2026-09-21 chore(images): update velero ...
+  	    commit 19a87e4 2026-08-09 revert(velero): drop the checksum workarounds
+  ```
 
 ## Running it in CI
 
@@ -256,4 +268,6 @@ Run on 2026-09-27 against `typesafe/jev-1.13-20260917`.
 - `recent_revert` flagged one plugin bump. It landed right after related
   workarounds in the same file were reverted, which is worth a look. It
   cleared the rest, the highest scoring 0.29.
+  That run used the earlier, file-level wording of the question; it now
+  asks only about the thing the PR changes.
 - No PR that changed configuration was passed as safe.

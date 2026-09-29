@@ -185,8 +185,12 @@ func Default() Config {
 			},
 			{
 				ID: "recent_revert",
-				Question: "Does the recent history show that something this pull request changes was recently " +
-					"reverted, rolled back, or deliberately pinned to an older version?",
+				// Scoped to the thing being changed: history is filtered to the
+				// PR's files, so an unrelated revert in the same file is common
+				// and would otherwise hold every later bump to that file.
+				Question: "Does the recent history show that the same dependency, image, or setting this pull request " +
+					"changes was itself recently reverted, rolled back, or deliberately pinned to an older version? " +
+					"A revert of a different change that happened to touch the same file does not count.",
 				Uses:      []string{SourceHistory},
 				Threshold: ptr(0.3),
 			},

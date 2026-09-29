@@ -47,6 +47,7 @@ type result struct {
 	HeadSHA    string            `json:"head_sha"`
 	AutoMerge  bool              `json:"auto_merge"`
 	Reasons    []string          `json:"reasons"`
+	Tripped    []gate.Trip       `json:"tripped,omitempty"`
 	Assessment *judge.Assessment `json:"assessment,omitempty"`
 }
 
@@ -188,7 +189,7 @@ func evaluate(ctx context.Context, ref string, local *rules.Config, src source, 
 	}
 	return result{
 		Repo: repo, Number: n, HeadSHA: pr.HeadSHA,
-		AutoMerge: v.AutoMerge, Reasons: v.Reasons, Assessment: v.Assessment,
+		AutoMerge: v.AutoMerge, Reasons: v.Reasons, Tripped: v.Tripped, Assessment: v.Assessment,
 	}, nil
 }
 
@@ -200,6 +201,15 @@ func printText(w io.Writer, r result) {
 	fmt.Fprintf(w, "%s#%d\t%s\n", r.Repo, r.Number, verdict)
 	for _, reason := range r.Reasons {
 		fmt.Fprintf(w, "\t- %s\n", reason)
+	}
+	for _, t := range r.Tripped {
+		if len(t.Read) == 0 {
+			continue
+		}
+		fmt.Fprintf(w, "\t%s read:\n", t.Watch)
+		for _, line := range t.Read {
+			fmt.Fprintf(w, "\t    %s\n", line)
+		}
 	}
 }
 
